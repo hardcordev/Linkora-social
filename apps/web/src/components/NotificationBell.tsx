@@ -51,6 +51,7 @@ export function NotificationBell({ tipToastThresholdXlm = 10 }: NotificationBell
   let markAllRead = async () => {};
   let markRead = (_id: string) => {};
   let markAllPending = false;
+  let resetUnread = () => {};
 
   try {
     const notifs = useNotifications();
@@ -59,6 +60,7 @@ export function NotificationBell({ tipToastThresholdXlm = 10 }: NotificationBell
     markAllRead = notifs.markAllRead || (async () => {});
     markRead = notifs.markRead || (() => {});
     markAllPending = notifs.markAllPending ?? false;
+    resetUnread = notifs.resetUnread || (() => {});
   } catch {
     try {
       const ctx = useNotificationsContext();
@@ -66,6 +68,7 @@ export function NotificationBell({ tipToastThresholdXlm = 10 }: NotificationBell
       unreadCount = ctx.unreadCount ?? 0;
       markAllRead = async () => { ctx.markAllRead(); };
       markRead = (_id: string) => { ctx.decrementUnread(); };
+      resetUnread = ctx.resetUnread || (() => {});
     } catch {
       // Fallback in isolated test harness
     }
@@ -125,6 +128,13 @@ export function NotificationBell({ tipToastThresholdXlm = 10 }: NotificationBell
     };
   }, [isOpen]);
 
+  // Clear badge when drawer opens
+  useEffect(() => {
+    if (isOpen) {
+      resetUnread();
+    }
+  }, [isOpen, resetUnread]);
+
   const toggleDropdown = useCallback(() => {
     setIsOpen((prev) => !prev);
   }, []);
@@ -181,7 +191,7 @@ export function NotificationBell({ tipToastThresholdXlm = 10 }: NotificationBell
             data-testid="unread-badge"
             className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 px-1 items-center justify-center rounded-full bg-violet-600 text-[10px] font-bold text-white shadow-sm ring-1 ring-white/20 animate-in fade-in zoom-in"
           >
-            {unreadCount > 99 ? "99+" : unreadCount}
+            {unreadCount > 9 ? "9+" : unreadCount}
           </span>
         )}
       </button>

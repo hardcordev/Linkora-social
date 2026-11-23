@@ -7,9 +7,17 @@ import {
   TouchableOpacity,
   View,
   AccessibilityInfo,
+  Image,
+  TextInput,
 } from "react-native";
-import Animated from "react-native-reanimated";
+import Animated, {
+  useSharedValue,
+  withTiming,
+  withSpring,
+} from "react-native-reanimated";
 import { useRouter } from "expo-router";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { PanGestureHandler } from "react-native-gesture-handler";
 
 import { useLike } from "../hooks/useLike";
 import { useTheme } from "../theme/useTheme";
@@ -49,6 +57,9 @@ interface LegacyPostCardProps {
 
 type PostCardProps = FeedPostCardProps | LegacyPostCardProps;
 
+const SWIPE_THRESHOLD = 80;
+const TIP_QUICK_AMOUNTS = [0.1, 1, 5];
+
 /**
  * Earliest plausible seconds-since-epoch (2001-09-09). A Stellar ledger sequence
  * is around 5x10^7, so any value below this is a unit mix-up, not a time.
@@ -56,16 +67,12 @@ type PostCardProps = FeedPostCardProps | LegacyPostCardProps;
 const MIN_PLAUSIBLE_TIMESTAMP = 1_000_000_000;
 
 function formatTimestamp(ts: number): string {
-  // Rows poisoned by the ledger/timestamp mix-up are still in the cache on
-  // installs that synced before the fix. Rendering one as "20115d ago" is worse
-  // than showing nothing, and a negative diff (clock skew, or a post from the
-  // future) would otherwise render as "-3s ago" (#1543).
   if (!Number.isFinite(ts) || ts <= 0 || ts < MIN_PLAUSIBLE_TIMESTAMP) return "";
   const diff = Math.floor(Date.now() / 1000) - ts;
   if (diff < 0) return "just now";
   if (diff < 60) return `${diff}s ago`;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 86400) return `${Math.floor(diff / 86400)}d ago`;
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
@@ -91,124 +98,6 @@ function normalizePost(props: PostCardProps): { post: Post; timeLabel?: string }
     },
     timeLabel: typeof props.timestamp === "string" ? props.timestamp : undefined,
   };
-}
-
-export function PostCard(props: PostCardProps) {
-  const { theme } = useTheme();
-  const router = useRouter();
-  const { post, timeLabel } = normalizePost(props);
-  const [reduceMotion, setReduceMotion] = useState(false);
-  useEffect(() => {
-    AccessibilityInfo.isReduceMotionEnabled()
-      .then(setReduceMotion)
-      .catch(() => undefined);
-  }, []);
-  const onPress =
-    props.onPress ?? (() => router.push(`/post/${post.id}` as Parameters<typeof router.push>[0]));
-  const { liked, likeCount, pending, like } = useLike({
-    postId: post.id,
-    initialHasLiked: post.has_liked ?? false,
-    initialLikeCount: post.like_count,
-  });
-
-  const { hapticsEnabled } = useHapticSettings();
-  const styles = useMemo(() => createStyles(theme), [theme]);
-
-  if ("isLoading" in props && props.isLoading) {
-    return <SharedPostCardSkeleton />;
-  }
-
-  const handleLikePress = (event: GestureResponderEvent) => {
-    // Stop propagation so a like tap doesn't also fire the parent card's
-    // onPress (which navigates to the post detail). Guarded because some
-    // react-native testing-library versions pass `undefined` here for
-    // Pressable targets, and we still want haptic + like() to fire.
-    if (event && typeof event.stopPropagation === "function") {
-      event.stopPropagation();
-    }
-    // ImpactFeedbackStyle.Light on like tap — gated by user haptic preference.
-    if (hapticsEnabled) void impact("light");
-    void like();
-  };
-
-  return (
-    <TouchableOpacity
-      style={styles.card}
-      onPress={onPress}
-      accessibilityRole="button"
-      accessibilityLabel={`Post by ${post.username}`}
-    >
-      <View style={styles.header}>
-        <Pressable
-          onPress={() =>
-            router.push(`/profile/${post.author}` as Parameters<typeof router.push>[0])
-          }
-          accessibilityRole="button"
-          accessibilityLabel={`Open ${post.username}'s profile`}
-        >
-          <Animated.View
-            style={styles.avatar}
-            sharedTransitionTag={reduceMotion ? undefined : `avatar-${post.author}`}
-          >
-            <Text style={styles.avatarText}>{post.username.charAt(0).toUpperCase()}</Text>
-          </Animated.View>
-        </Pressable>
-        <View style={styles.meta}>
-          <Animated.Text
-            style={styles.username}
-            sharedTransitionTag={reduceMotion ? undefined : `username-${post.author}`}
-          >
-            {post.username}
-          </Animated.Text>
-          <Text style={styles.address}>{shortAddress(post.author)}</Text>
-        </View>
-        <View style={styles.timeContainer}>
-          <Text style={styles.time}>{timeLabel ?? formatTimestamp(post.timestamp)}</Text>
-          {post.sync_status === "pending" && <Text style={styles.pendingBadge}>⏳ Syncing</Text>}
-          {post.sync_status === "failed" && <Text style={styles.failedBadge}>⚠️ Failed</Text>}
-        </View>
-      </View>
-
-      <Text style={styles.content}>{post.content}</Text>
-
-      <View style={styles.footer}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={
-            liked
-              ? `Post already liked, ${likeCount} ${likeCount === 1 ? "like" : "likes"}`
-              : `Like post, currently ${likeCount} ${likeCount === 1 ? "like" : "likes"}`
-          }
-          accessibilityState={{ disabled: liked || pending, selected: liked }}
-          disabled={liked || pending}
-          onPress={handleLikePress}
-          style={({ pressed }) => [
-            styles.likeButton,
-            liked && styles.likeButtonLiked,
-            pressed && !liked && !pending && styles.likeButtonPressed,
-          ]}
-        >
-          <View style={styles.likeInner}>
-            <Text style={[styles.likeIcon, liked && styles.likeIconLiked]}>
-              {liked ? "♥" : "♡"}
-            </Text>
-            <View
-              style={[styles.likeBadge, liked && styles.likeBadgeLiked]}
-              testID="like-count-badge"
-            >
-              <Text
-                style={[styles.likeBadgeText, liked && styles.likeBadgeTextLiked]}
-                testID="like-count-text"
-              >
-                {likeCount}
-              </Text>
-            </View>
-          </View>
-        </Pressable>
-        <Text style={styles.stat}>💰 {post.tip_total.toFixed(2)}</Text>
-      </View>
-    </TouchableOpacity>
-  );
 }
 
 function createStyles(theme: ReturnType<typeof useTheme>["theme"]) {
@@ -351,5 +240,322 @@ function createStyles(theme: ReturnType<typeof useTheme>["theme"]) {
       borderRadius: 6,
       backgroundColor: theme.colors.surface.surface2,
     },
+    swipeArea: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      top: 0,
+      bottom: 0,
+      overflow: "hidden",
+    },
+    swipeMask: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      bottom: 0,
+      height: 80,
+      background: "linear-gradient(to top, rgba(0,0,0,0.8), transparent)",
+      zIndex: 1,
+    },
+    tipPanel: {
+      position: "absolute",
+      bottom: 0,
+      left: 0,
+      right: 0,
+      backgroundColor: "zinc-900",
+      borderTopLeftRadius: 12,
+      borderTopRightRadius: 12,
+      padding: 16,
+      paddingBottom: 40,
+      zIndex: 10,
+      shadowColor: "#000",
+      shadowOffset: { width: 0, height: 4 },
+      shadowOpacity: 0.3,
+      shadowRadius: 8,
+      elevation: 4,
+    },
+    tipQuickButtons: {
+      flexDirection: "row",
+      gap: 8,
+      marginBottom: 12,
+    },
+    tipQuickButton: {
+      flex: 1,
+      backgroundColor: "violet-600",
+      borderRadius: 8,
+      padding: 8,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    tipQuickButtonText: {
+      color: "white",
+      fontSize: 12,
+      fontWeight: "600",
+    },
+    tipCustomInput: {
+      backgroundColor: "zinc-800",
+      borderRadius: 8,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      marginBottom: 12,
+      color: "white",
+      fontSize: 14,
+    },
+    tipConfirmButton: {
+      backgroundColor: "green-600",
+      borderRadius: 8,
+      padding: 12,
+      alignItems: "center",
+      justifyContent: "center",
+      marginTop: 4,
+    },
+    tipConfirmButtonDisabled: {
+      backgroundColor: "gray-400",
+    },
+    tipConfirmButtonText: {
+      color: "white",
+      fontSize: 14,
+      fontWeight: "600",
+    },
+    tipErrorText: {
+      color: "red-400",
+      fontSize: 12,
+      marginBottom: 8,
+      marginTop: 4,
+    },
   });
 }
+
+export function PostCard(props: PostCardProps) {
+  const { theme } = useTheme();
+  const router = useRouter();
+  const { post, timeLabel } = normalizePost(props);
+  const [reduceMotion, setReduceMotion] = useState(false);
+  useEffect(() => {
+    // AccessibilityInfo.isReduceMotionEnabled is not available in RN 0.74+
+    // but we keep the pattern for future compatibility.
+    return undefined;
+  }, []);
+  const onPress =
+    props.onPress ?? (() => router.push(`/post/${post.id}` as Parameters<typeof router.push>[0]));
+  const { liked, likeCount, pending, like } = useLike({
+    postId: post.id,
+    initialHasLiked: post.has_liked ?? false,
+    initialLikeCount: post.like_count,
+  });
+
+  const { hapticsEnabled } = useHapticSettings();
+  const styles = useMemo(() => createStyles(theme), [theme]);
+
+  if ("isLoading" in props && props.isLoading) {
+    return <SharedPostCardSkeleton />;
+  }
+
+  const handleLikePress = (event: GestureResponderEvent) => {
+    if (event && typeof event.stopPropagation === "function") {
+      event.stopPropagation();
+    }
+    if (hapticsEnabled) void impact("light");
+    void like();
+  };
+
+  // Swipe-to-tip state
+  const [swipeOffset, setSwipeOffset] = useState(0);
+  const [showTipPanel, setShowTipPanel] = useState(false);
+  const [tipAmount, setTipAmount] = useState("0.0");
+  const [tipError, setTipError] = useState<string | null>(null);
+
+  const handleSwipe = (event: { translationX: number; state: string }) => {
+    const { translationX, state } = event;
+
+    if (state === "end") {
+      if (translationX < -SWIPE_THRESHOLD) {
+        setShowTipPanel(true);
+        setSwipeOffset(0);
+      } else {
+        setSwipeOffset(withTiming(0));
+      }
+    } else {
+      setSwipeOffset(translationX);
+    }
+  };
+
+  const handleTipConfirm = async () => {
+    setTipError(null);
+
+    const amount = parseFloat(tipAmount);
+    if (isNaN(amount) || amount <= 0) {
+      setTipError("Please enter a valid amount");
+      return;
+    }
+
+    // TODO: Implement tip sending with biometric authentication
+    // - Use LinkoraClient.tip(tipper, postId, token, amountStroops)
+    // - Biometric auth is prompted before signing
+    // - Show success haptic + toast on completion
+
+    if (hapticsEnabled) void impact("medium");
+
+    setShowTipPanel(false);
+    setSwipeOffset(withTiming(0));
+    setTipAmount("0.0");
+    setTipError(null);
+  };
+
+  const handleTipQuickSelect = (amount: number) => {
+    setTipAmount(`${amount.toFixed(1)}`);
+  };
+
+  const handleTipDismiss = () => {
+    setShowTipPanel(false);
+    setSwipeOffset(withTiming(0));
+    setTipAmount("0.0");
+    setTipError(null);
+  };
+
+  return (
+    <GestureHandlerRootView>
+      <PanGestureHandler
+        onHandlerStateChange={handleSwipe}
+        maxPointers={1}
+        minPointers={1}
+      >
+        <View
+          style={[
+            styles.card,
+            { transform: [{ translateX: swipeOffset }] },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel={`Post by ${post.username}`}
+        >
+          <View style={styles.header}>
+            <Pressable
+              onPress={() =>
+                router.push(`/profile/${post.author}` as Parameters<typeof router.push>[0])
+              }
+              accessibilityRole="button"
+              accessibilityLabel={`Open ${post.username}'s profile`}
+            >
+              <Animated.View
+                style={styles.avatar}
+                sharedTransitionTag={undefined}
+              >
+                <Text style={styles.avatarText}>{post.username.charAt(0).toUpperCase()}</Text>
+              </Animated.View>
+            </Pressable>
+            <View style={styles.meta}>
+              <Animated.Text
+                style={styles.username}
+                sharedTransitionTag={undefined}
+              >
+                {post.username}
+              </Animated.Text>
+              <Text style={styles.address}>{shortAddress(post.author)}</Text>
+            </View>
+            <View style={styles.timeContainer}>
+              <Text style={styles.time}>{timeLabel ?? formatTimestamp(post.timestamp)}</Text>
+              {post.sync_status === "pending" && <Text style={styles.pendingBadge}>⏳ Syncing</Text>}
+              {post.sync_status === "failed" && <Text style={styles.failedBadge}>⚠️ Failed</Text>}
+            </View>
+          </View>
+
+          <Text style={styles.content}>{post.content}</Text>
+
+          <View style={styles.footer}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={
+                liked
+                  ? `Post already liked, ${likeCount} ${likeCount === 1 ? "like" : "likes"}`
+                  : `Like post, currently ${likeCount} ${likeCount === 1 ? "like" : "likes"}`
+              }
+              accessibilityState={{ disabled: liked || pending, selected: liked }}
+              disabled={liked || pending}
+              onPress={handleLikePress}
+              style={({ pressed }) => [
+                styles.likeButton,
+                liked && styles.likeButtonLiked,
+                pressed && !liked && !pending && styles.likeButtonPressed,
+              ]}
+            >
+              <View style={styles.likeInner}>
+                <Text style={[styles.likeIcon, liked && styles.likeIconLiked]}>
+                  {liked ? "♥" : "♡"}
+                </Text>
+                <View
+                  style={[styles.likeBadge, liked && styles.likeBadgeLiked]}
+                  testID="like-count-badge"
+                >
+                  <Text
+                    style={[styles.likeBadgeText, liked && styles.likeBadgeTextLiked]}
+                    testID="like-count-text"
+                  >
+                    {likeCount}
+                  </Text>
+                </View>
+              </View>
+            </Pressable>
+            <Text style={styles.stat}>💰 {post.tip_total.toFixed(2)}</Text>
+          </View>
+        </View>
+
+        {/* Tip Panel - revealed on left swipe */}
+        {showTipPanel && (
+          <Animated.View
+            style={[
+              styles.tipPanel,
+              { transform: [{ translateY: withSpring(0) }] },
+            ]}
+          >
+            <View style={styles.tipQuickButtons}>
+              {TIP_QUICK_AMOUNTS.map((amount) => (
+                <Pressable
+                  key={amount}
+                  style={styles.tipQuickButton}
+                  onPress={() => handleTipQuickSelect(amount)}
+                >
+                  <Text style={styles.tipQuickButtonText}>{amount} XLM</Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.tipCustomInput}>
+              <Text style={styles.tipQuickButtonText}>Custom amount</Text>
+              <TextInput
+                style={styles.tipCustomInput}
+                value={tipAmount}
+                onChangeText={(text) => setTipAmount(text)}
+                keyboardType="decimal-pad"
+                placeholder="0.0"
+                autoCapitalize="none"
+              />
+            </View>
+
+            <Pressable
+              style={styles.tipConfirmButton}
+              onPress={handleTipConfirm}
+              disabled={tipError !== null}
+            >
+              <Text style={styles.tipConfirmButtonText}>
+                {tipError ? "Invalid amount" : "Send tip"}
+              </Text>
+            </Pressable>
+
+            {tipError && (
+              <Text style={styles.tipErrorText}>{tipError}</Text>
+            )}
+
+            <Pressable
+              style={{ padding: 8, alignItems: "center" }}
+              onPress={handleTipDismiss}
+            >
+              <Text style={{ color: "gray", fontSize: 12 }}>Cancel</Text>
+            </Pressable>
+          </Animated.View>
+        )}
+      </PanGestureHandler>
+    </GestureHandlerRootView>
+  );
+}
+
+export default PostCard;

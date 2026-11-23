@@ -2,10 +2,14 @@ import { useCallback } from "react";
 import { useToast } from "../context/ToastContext";
 import { useNetworkContext } from "../context/NetworkContext";
 import { buildTxXdr } from "../utils/txDescriptors";
+import {
+  biometricSessionManager,
+  checkBiometricsAvailable,
+} from "../utils/biometric-signer";
 import { notification } from "../utils/haptics";
 
 // ---------------------------------------------------------------------------
-// Types for the Soroban RPC responses we care about
+// Soroban RPC helpers
 // ---------------------------------------------------------------------------
 
 interface SendTransactionResponse {
@@ -21,10 +25,6 @@ interface GetTransactionResponse {
   envelopeXdr?: string;
   createdAt?: number;
 }
-
-// ---------------------------------------------------------------------------
-// Soroban RPC helpers
-// ---------------------------------------------------------------------------
 
 async function rpcRequest<T>(
   rpcUrl: string,
@@ -68,10 +68,6 @@ async function rpcRequest<T>(
   }
 }
 
-/**
- * Submit a signed transaction XDR to the Soroban RPC and return the tx hash.
- * Throws if the RPC rejects submission.
- */
 async function sendTransaction(
   rpcUrl: string,
   signedXdr: string
@@ -79,10 +75,6 @@ async function sendTransaction(
   return rpcRequest<SendTransactionResponse>(rpcUrl, "sendTransaction", [{ transaction: signedXdr }]);
 }
 
-/**
- * Poll getTransaction until the chain confirms (SUCCESS/FAILED) or the timeout
- * elapses. Defaults: poll every 1 s, give up after 30 s.
- */
 async function pollTransaction(
   rpcUrl: string,
   hash: string,
@@ -110,21 +102,6 @@ async function pollTransaction(
 // Hook
 // ---------------------------------------------------------------------------
 
-/**
- * useSubmitTx
- *
- * Returns a `submitTx(txDescriptor)` function that:
- *   1. Converts the descriptor into genuine base64 XDR via the SDK's
- *      simulate-and-assemble pipeline (#1591 — callers used to hand this hook
- *      a plain string and it was signed as if it were XDR).
- *   2. Asks the connected wallet SDK to sign that XDR.
- *   3. Broadcasts the signed XDR via the Soroban RPC sendTransaction endpoint.
- *   4. Polls getTransaction until the chain confirms or a 30 s timeout elapses.
- *   5. Returns the real transaction hash.
- *
- * The wallet only ever receives real XDR, and the hook only reports success for
- * a hash the network returned. Toasts are shown for pending / success / error.
- */
 export function useSubmitTx() {
   const { showPending, showSuccess, showError } = useToast();
   const { rpcUrl, contractId, network } = useNetworkContext();
@@ -164,43 +141,100 @@ export function useSubmitTx() {
         });
 
         // ------------------------------------------------------------------
-        // Sign + broadcast
+        // Biometric authentication protection
         // ------------------------------------------------------------------
 
-        // Prefer the full sign-and-submit path if the adapter exposes it
-        // (some wallet SDKs handle the broadcast internally).
-        if (typeof walletKit.signAndSubmitTransaction === "function") {
-          const result = await walletKit.signAndSubmitTransaction({ txXdr, rpcUrl });
-          const hash = result.hash ?? result.txHash;
-          if (!hash) throw new Error("Wallet returned no transaction hash");
-          // Poll for chain confirmation before reporting success
-          await pollTransaction(rpcUrl, hash);
-          showSuccess(hash);
-          return hash;
+        // Check if biometrics are available on this device
+        const biometricsAvailable = await checkBiometricsAvailable();
+
+        let result: { hash: string };
+
+        if (biometricsAvailable.available) {
+          // Prompt for biometric authentication before signing
+          const authResult = await biometricSessionManager.authenticateWithBiometrics({
+            promptMessage: "Authorize transaction with biometrics",
+          });
+
+          if (!authResult.success) {
+            if (authResult.fallbackToPassphrase) {
+              throw new Error(
+                "Biometric authentication failed. Maximum retry attempts reached. " +
+                  "Please use your passphrase to sign the transaction."
+              );
+            }
+            throw new Error(authResult.error || "Biometric authentication failed");
+          }
+
+          // Perform the actual signing using the wallet kit
+          if (typeof walletKit.signAndSubmitTransaction === "function") {
+            const signingResult = await walletKit.signAndSubmitTransaction({
+              txXdr,
+              rpcUrl,
+            });
+            const hash = signingResult.hash ?? signingResult.txHash;
+            if (!hash) throw new Error("Wallet returned no transaction hash");
+            // Poll for chain confirmation before reporting success
+            await pollTransaction(rpcUrl, hash);
+            showSuccess(hash);
+            result = { hash };
+          } else if (typeof walletKit.signTransaction !== "function") {
+            throw new Error("Wallet does not support transaction signing");
+          } else {
+            const signed = await walletKit.signTransaction({ txXdr });
+            const signedXdr = signed.signedTxXdr ?? signed.signedXdr ?? signed.signed;
+            if (!signedXdr) {
+              throw new Error("Wallet did not return a signed transaction XDR");
+            }
+
+            const submission = await sendTransaction(rpcUrl, signedXdr);
+
+            if (submission.status === "ERROR") {
+              throw new Error(`Transaction rejected by network (status: ${submission.status})`);
+            }
+
+            // Wait for chain confirmation
+            await pollTransaction(rpcUrl, submission.hash);
+            showSuccess(submission.hash);
+            result = { hash: submission.hash };
+          }
+        } else {
+          // Biometrics not available: sign directly without protection
+          // Prefer the full sign-and-submit path if the adapter exposes it
+          // (some wallet SDKs handle the broadcast internally).
+          if (typeof walletKit.signAndSubmitTransaction === "function") {
+            const signingResult = await walletKit.signAndSubmitTransaction({ txXdr, rpcUrl });
+            const hash = signingResult.hash ?? signingResult.txHash;
+            if (!hash) throw new Error("Wallet returned no transaction hash");
+            // Poll for chain confirmation before reporting success
+            await pollTransaction(rpcUrl, hash);
+            showSuccess(hash);
+            return hash;
+          }
+
+          // Otherwise: sign → broadcast → poll
+          if (typeof walletKit.signTransaction !== "function") {
+            throw new Error("Wallet does not support transaction signing");
+          }
+
+          const signed = await walletKit.signTransaction({ txXdr });
+          const signedXdr = signed.signedTxXdr ?? signed.signedXdr ?? signed.signed;
+          if (!signedXdr) {
+            throw new Error("Wallet did not return a signed transaction XDR");
+          }
+
+          const submission = await sendTransaction(rpcUrl, signedXdr);
+
+          if (submission.status === "ERROR") {
+            throw new Error(`Transaction rejected by network (status: ${submission.status})`);
+          }
+
+          // Wait for chain confirmation
+          await pollTransaction(rpcUrl, submission.hash);
+          showSuccess(submission.hash);
+          return submission.hash;
         }
 
-        // Otherwise: sign → broadcast → poll
-        if (typeof walletKit.signTransaction !== "function") {
-          throw new Error("Wallet does not support transaction signing");
-        }
-
-        const signed = await walletKit.signTransaction({ txXdr });
-        const signedXdr = signed.signedTxXdr ?? signed.signedXdr ?? signed.signed;
-        if (!signedXdr) {
-          throw new Error("Wallet did not return a signed transaction XDR");
-        }
-
-        const submission = await sendTransaction(rpcUrl, signedXdr);
-
-        if (submission.status === "ERROR") {
-          throw new Error(`Transaction rejected by network (status: ${submission.status})`);
-        }
-
-        // Wait for chain confirmation
-        await pollTransaction(rpcUrl, submission.hash);
-
-        showSuccess(submission.hash);
-        return submission.hash;
+        return result.hash;
       } catch (err) {
         void notification("error");
         const msg = err instanceof Error ? err.message : "Failed to submit transaction";
